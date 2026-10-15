@@ -34,6 +34,9 @@ from flash_attn.cute.flash_fwd import FlashAttentionForwardSm80
 from flash_attn.cute.flash_fwd_sm90 import FlashAttentionForwardSm90
 from flash_attn.cute.flash_fwd_sm100 import FlashAttentionForwardSm100
 from flash_attn.cute.flash_fwd_sm120 import FlashAttentionForwardSm120
+from flash_attn.cute.flash_fwd_sm120 import create_sm120_relative_bias_scoremod
+from flash_attn.cute.flash_fwd_sm120_tma import FlashAttentionForwardSm120Tma
+from flash_attn.cute.flash_fwd_sm120_fp8 import FlashAttentionForwardSm120Fp8, native_fp8_available
 from flash_attn.cute.flash_fwd_combine import FlashAttentionForwardCombine
 from flash_attn.cute.flash_fwd_mla_sm100 import FlashAttentionMLAForwardSm100
 from flash_attn.cute.shearing_bias import ShearingBias
@@ -420,16 +423,30 @@ def _flash_attn_fwd(
         ), "inputs must be on CUDA device"
     arch = _get_device_arch() if _arch is None else _arch
     if q.dtype == torch.float8_e4m3fn and not blockscaled:
-        assert arch in [100, 103], (
-            "unscaled FP8 attention is only supported on SM100/SM103"
+        assert arch in [100, 103, 120, 121], (
+            "unscaled FP8 attention is only supported on SM100/SM103/SM120/SM121"
         )
         assert not (head_dim == 256 and head_dim_v == 256), (
             "unscaled FP8 attention does not support head_dim 256 "
             "(the dedicated hd256 kernel has no fp8 path)"
         )
     assert arch // 10 in [8, 9, 10, 11, 12], "Unsupported compute capability. Supported: 8.x, 9.x, 10.x, 11.x, 12.x"
+    if arch // 10 == 12:
+        assert not blockscaled and not v_blockscaled, "SM12x does not support block-scaled FP8"
+        assert 8 <= head_dim <= 128 and 8 <= head_dim_v <= 128, (
+            "SM120/SM121 requires head_dim and head_dim_v between 8 and 128"
+        )
+        assert not return_logits_max and logits_max is None, "SM12x does not support logits_max"
+        assert bias is None, "SM12x accepts rel_bias, not pre-sheared bias"
+        assert scheduler_metadata is None, "SM12x does not support scheduler_metadata"
+        if page_table is not None:
+            assert seqused_k is not None, "Paged KV on SM12x requires seqused_k"
     assert num_head % num_head_kv == 0, "num_head must be divisible by num_head_kv"
     alignment = 16 // q.element_size()
+    if arch // 10 == 12:
+        assert head_dim % alignment == 0 and head_dim_v % alignment == 0, (
+            f"SM12x head dimensions must be divisible by {alignment}"
+        )
     if arch // 10 not in [8, 12]:
         _validate_head_dims(head_dim, head_dim_v, arch // 10, alignment)
     if softmax_scale is None:
@@ -438,6 +455,7 @@ def _flash_attn_fwd(
         softcap = None
 
     plain_fp8 = q.dtype == torch.float8_e4m3fn and not blockscaled
+    use_native_sm120_fp8 = arch // 10 == 12 and plain_fp8 and native_fp8_available()
     out_torch_dtype = (
         torch.bfloat16
         if v_blockscaled or plain_fp8
@@ -508,6 +526,10 @@ def _flash_attn_fwd(
         pack_gqa = False
     if arch // 10 in [10, 11] and (128 % qhead_per_kvhead != 0):
         pack_gqa = False
+    # The inherited SM80 layout does not implement packed GQA. Disable it before
+    # tile/scheduler/relative-bias preparation as well as in the kernel itself.
+    if arch // 10 == 12:
+        pack_gqa = False
     
     if pack_gqa:
         q_sf_interleaved = False
@@ -541,6 +563,11 @@ def _flash_attn_fwd(
     else:
         fwd_cfg = FwdConfig(tile_mn[0], tile_mn[1], fwd_cfg.mma_pv_is_rs, fwd_cfg.intra_wg_overlap)
     tile_m, tile_n = fwd_cfg.m_block_size, fwd_cfg.n_block_size
+    if arch // 10 == 12:
+        sm120_config_cls = FlashAttentionForwardSm120Fp8 if use_native_sm120_fp8 else FlashAttentionForwardSm120
+        assert sm120_config_cls.can_implement(
+            dtype, head_dim, head_dim_v, tile_m, tile_n, 1, num_threads, causal
+        ), "SM12x tile configuration exceeds shared memory or has unsupported dimensions"
     if mma_pv_is_rs is None:
         mma_pv_is_rs = fwd_cfg.mma_pv_is_rs
     if intra_wg_overlap is None:
@@ -570,6 +597,11 @@ def _flash_attn_fwd(
     if num_splits < 1:
         num_splits = num_splits_heuristic(total_mblocks, num_SMs, num_n_blocks, 128)
         # print(f"num splits by heuristic = {num_splits} for {seqlen_q = }, {seqlen_k = }, {total_mblocks =}, {num_m_blocks = }, {num_n_blocks =},")
+
+    # Match the SM12x reference bundle's single-split contract. Its mainloops
+    # cannot write the FP32 partials expected by this tree's combine kernel.
+    if arch // 10 == 12:
+        num_splits = 1
 
     # SplitKV uses float32 partial output, which doubles the O buffer size
     # in shared memory, causing OOM for diff-headdim (192, 128)
@@ -622,6 +654,22 @@ def _flash_attn_fwd(
     elif score_mod is not None:
         if arch // 10 == 8:
             raise NotImplementedError("Custom user-provided score_mod is not supported on SM8x architectures.")
+
+    if arch // 10 == 12 and rel_bias is not None:
+        rel_extent = rel_bias.shape[-1]
+        assert rel_extent > 0 and rel_extent % 128 == 0
+        _validate_tensor(
+            rel_bias, "rel_bias", (*q.shape[:-1], rel_extent), rel_bias.dtype, device
+        )
+        assert rel_bias.dtype in (q.dtype, torch.float16, torch.bfloat16, torch.float32)
+        # Read unsheared bias with sequence-local indices. This permits SM12x's
+        # 128x64 tiles and avoids quantizing bias/P through an FP8 shared tile.
+        user_aux_count = len(aux_tensors) if aux_tensors is not None else 0
+        aux_tensors = [*(aux_tensors or []), rel_bias]
+        score_mod = create_sm120_relative_bias_scoremod(
+            score_mod, user_aux_count, cu_seqlens_q is not None
+        )
+        rel_bias = None
         
     # hash score and mask mods for compile cache
     score_mod_hash = utils.hash_callable(score_mod) if score_mod is not None else False
@@ -1031,6 +1079,7 @@ def _flash_attn_fwd(
         is_split_kv,
         pack_gqa,
         arch,
+        use_native_sm120_fp8,
         paged_kv_non_tma,  # paged KV non-TMA
         use_2cta_instrs,
         q_subtile_factor,
@@ -1254,11 +1303,28 @@ def _flash_attn_fwd(
                     kv_sf_interleaved=kv_sf_interleaved,
                 )
         elif arch // 10 == 12:
-            # SM120 (Blackwell GeForce / DGX Spark): uses SM80 MMA with SM120 SMEM capacity
-            assert not use_block_sparsity, "Block sparsity not supported on SM 12.0"
-            assert page_table is None, "Paged KV not supported on SM 12.0 in this PR"
-            assert not is_split_kv, "SplitKV not supported on SM 12.0 in this PR"
-            fa_fwd = FlashAttentionForwardSm120(
+            use_tma_sm120 = (
+                not plain_fp8
+                and page_table is None
+                and not is_varlen
+                and not use_block_sparsity
+                and head_dim % 64 == 0
+                and head_dim_v % 64 == 0
+                and head_dim_v <= head_dim
+                and FlashAttentionForwardSm120Tma.can_implement(
+                    dtype, head_dim, head_dim_v, tile_m, tile_n,
+                    num_mma_warps=4, kv_stages=2, is_causal=causal,
+                )
+            )
+            sm120_cls = (
+                FlashAttentionForwardSm120Fp8 if use_native_sm120_fp8 else
+                FlashAttentionForwardSm120Tma if use_tma_sm120 else FlashAttentionForwardSm120
+            )
+            sm120_kwargs = (
+                dict(num_mma_warps=4, kv_stages=2)
+                if use_tma_sm120 else dict(num_stages=1, num_threads=num_threads, Q_in_regs=False)
+            )
+            fa_fwd = sm120_cls(
                 dtype,
                 head_dim,
                 head_dim_v,
@@ -1268,12 +1334,10 @@ def _flash_attn_fwd(
                 pack_gqa=pack_gqa,
                 tile_m=tile_m,
                 tile_n=tile_n,
-                num_stages=1,
-                num_threads=num_threads,
-                Q_in_regs=False,
                 score_mod=score_mod,
                 mask_mod=mask_mod,
                 has_aux_tensors=aux_tensors is not None,
+                **sm120_kwargs,
             )
         else:
             raise ValueError(
@@ -1347,8 +1411,8 @@ def _flash_attn_fwd(
                 seqused_q_tensor,
                 seqused_k_tensor,
                 page_table_tensor,
-                window_size_left,
-                window_size_right,
+                Int32(window_size_left) if window_size_left is not None else None,
+                Int32(window_size_right) if window_size_right is not None else None,
                 learnable_sink_tensor,
                 sparse_tensors,
                 cute_aux_tensors,
@@ -1426,7 +1490,10 @@ def _flash_attn_fwd(
                 window_size_left,
                 window_size_right,
                 learnable_sink,
-                normalized_block_sparse_tensors[:4]
+                (
+                    (*normalized_block_sparse_tensors[:6], *normalized_block_sparse_tensors[7:9])
+                    if arch // 10 == 12 else normalized_block_sparse_tensors[:4]
+                )
                 if normalized_block_sparse_tensors is not None
                 else None,
                 aux_tensors,
